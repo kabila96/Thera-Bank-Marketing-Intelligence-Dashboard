@@ -17,6 +17,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import permutation_importance
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 
 # -----------------------------
 # CONFIG
@@ -150,16 +151,153 @@ st.markdown(
 # -----------------------------
 # LOADERS
 # -----------------------------
+
+def _safe_read_json(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _compute_lift_table(df: pd.DataFrame, prob_col: str = "predicted_probability", target_col: str = "Personal Loan") -> pd.DataFrame:
+    out = df[[prob_col, target_col]].copy().sort_values(prob_col, ascending=False).reset_index(drop=True)
+    out["decile"] = pd.qcut(np.arange(len(out)), 10, labels=[f"D{i}" for i in range(1, 11)])
+    grouped = out.groupby("decile", observed=False).agg(
+        customers=(target_col, "size"),
+        responders=(target_col, "sum"),
+    ).reset_index()
+    grouped["response_rate"] = grouped["responders"] / grouped["customers"]
+    baseline = out[target_col].mean()
+    grouped["lift"] = grouped["response_rate"] / baseline
+    grouped["cum_customers"] = grouped["customers"].cumsum()
+    grouped["cum_responders"] = grouped["responders"].cumsum()
+    grouped["cum_customer_pct"] = grouped["cum_customers"] / grouped["customers"].sum() * 100
+    grouped["cum_gain_pct"] = grouped["cum_responders"] / grouped["responders"].sum() * 100
+    return grouped
+
+
+def _compute_roi_curve(scores: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for threshold in np.round(np.arange(0.01, 1.00, 0.01), 2):
+        metrics = compute_roi_table(scores, float(threshold), PROFIT_PER_SUCCESS, CONTACT_COST)
+        metrics["threshold"] = float(threshold)
+        rows.append(metrics)
+    return pd.DataFrame(rows)
+
+
+def _build_artifacts_if_missing(raw: pd.DataFrame):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    needed = [
+        OUTPUT_DIR / "customer_targeting_scores.csv",
+        OUTPUT_DIR / "cv_model_comparison.csv",
+        OUTPUT_DIR / "test_model_comparison.csv",
+        OUTPUT_DIR / "lift_gain_decile_table.csv",
+        OUTPUT_DIR / "roi_threshold_table.csv",
+        OUTPUT_DIR / "data_audit.json",
+    ]
+    if all(p.exists() for p in needed):
+        return
+
+    df = raw.copy()
+    df["Experience"] = df["Experience"].clip(lower=0)
+    X = df[FEATURE_COLUMNS].copy()
+    y = df["Personal Loan"].astype(int)
+
+    model_specs = {
+        "KNN": (
+            KNeighborsClassifier(n_neighbors=5, weights="distance", p=1),
+            {"smote__k_neighbors": 5, "model__n_neighbors": 5, "model__weights": "distance", "model__p": 1},
+        ),
+        "Logistic Regression": (
+            LogisticRegression(C=1.0, solver="liblinear", penalty="l2", max_iter=5000, random_state=42),
+            {"smote__k_neighbors": 5, "model__C": 1.0, "model__solver": "liblinear", "model__penalty": "l2"},
+        ),
+        "Naive Bayes": (
+            GaussianNB(var_smoothing=1e-9),
+            {"smote__k_neighbors": 5, "model__var_smoothing": 1e-9},
+        ),
+    }
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.30, stratify=y, random_state=42
+    )
+
+    cv_rows, test_rows = [], []
+    test_prob_store = {}
+
+    for model_name, (model_obj, best_params) in model_specs.items():
+        pipeline = _build_model_by_name(model_name, best_params.copy())
+
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        oof = cross_val_predict(pipeline, X_train, y_train, cv=cv, method="predict_proba", n_jobs=1)[:, 1]
+        oof_pred = (oof >= 0.5).astype(int)
+
+        cv_rows.append({
+            "model": model_name,
+            "cv_precision_mean": precision_score(y_train, oof_pred, zero_division=0),
+            "cv_recall_mean": recall_score(y_train, oof_pred, zero_division=0),
+            "cv_f1_mean": f1_score(y_train, oof_pred, zero_division=0),
+            "cv_roc_auc_mean": roc_auc_score(y_train, oof),
+            "best_params": str(best_params),
+        })
+
+        pipeline.fit(X_train, y_train)
+        test_prob = pipeline.predict_proba(X_test)[:, 1]
+        test_pred = (test_prob >= 0.5).astype(int)
+        test_prob_store[model_name] = test_prob
+
+        test_rows.append({
+            "model": model_name,
+            "test_precision": precision_score(y_test, test_pred, zero_division=0),
+            "test_recall": recall_score(y_test, test_pred, zero_division=0),
+            "test_f1": f1_score(y_test, test_pred, zero_division=0),
+            "test_roc_auc": roc_auc_score(y_test, test_prob),
+        })
+
+    cv_df = pd.DataFrame(cv_rows)
+    test_df = pd.DataFrame(test_rows)
+    best_name = test_df.sort_values("test_f1", ascending=False).iloc[0]["model"]
+
+    scores = X_test.copy()
+    scores["Personal Loan"] = y_test.values
+    scores["predicted_probability"] = test_prob_store[best_name]
+    if "ID" in df.columns:
+        scores["ID"] = df.loc[X_test.index, "ID"].values
+
+    lift_df = _compute_lift_table(scores)
+    roi_df = _compute_roi_curve(scores)
+
+    audit = {
+        "rows": int(len(raw)),
+        "columns": int(raw.shape[1]),
+        "negative_experience_count": int((raw["Experience"] < 0).sum()) if "Experience" in raw.columns else 0,
+        "total_missing_values": int(raw.isna().sum().sum()),
+        "duplicate_rows": int(raw.duplicated().sum()),
+        "positive_class_count": int(raw["Personal Loan"].sum()),
+        "positive_class_rate": float(raw["Personal Loan"].mean()),
+    }
+
+    scores.to_csv(OUTPUT_DIR / "customer_targeting_scores.csv", index=False)
+    cv_df.to_csv(OUTPUT_DIR / "cv_model_comparison.csv", index=False)
+    test_df.to_csv(OUTPUT_DIR / "test_model_comparison.csv", index=False)
+    lift_df.to_csv(OUTPUT_DIR / "lift_gain_decile_table.csv", index=False)
+    roi_df.to_csv(OUTPUT_DIR / "roi_threshold_table.csv", index=False)
+    with open(OUTPUT_DIR / "data_audit.json", "w", encoding="utf-8") as f:
+        json.dump(audit, f, indent=2)
+
+    summary = build_insight_report(raw, test_df, lift_df, roi_df, audit)
+    (OUTPUT_DIR / "executive_summary.txt").write_text(summary, encoding="utf-8")
+
+
 @st.cache_data(show_spinner=False)
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     raw = pd.read_csv(DATA_PATH)
+    _build_artifacts_if_missing(raw)
     scores = pd.read_csv(OUTPUT_DIR / "customer_targeting_scores.csv")
     cv = pd.read_csv(OUTPUT_DIR / "cv_model_comparison.csv")
     test = pd.read_csv(OUTPUT_DIR / "test_model_comparison.csv")
     lift = pd.read_csv(OUTPUT_DIR / "lift_gain_decile_table.csv")
     roi = pd.read_csv(OUTPUT_DIR / "roi_threshold_table.csv")
-    with open(OUTPUT_DIR / "data_audit.json", "r", encoding="utf-8") as f:
-        audit = json.load(f)
+    audit = _safe_read_json(OUTPUT_DIR / "data_audit.json")
     return raw, scores, cv, test, lift, roi, audit
 
 
@@ -608,7 +746,8 @@ if page == "Executive Overview":
         st.metric("Lift in first decile", f"{top_decile['lift']:.2f}x")
         st.metric("Top-decile response rate", f"{top_decile['response_rate']:.1%}")
 
-        summary_text = (OUTPUT_DIR / "executive_summary.txt").read_text(encoding="utf-8")
+        summary_path = OUTPUT_DIR / "executive_summary.txt"
+        summary_text = summary_path.read_text(encoding="utf-8") if summary_path.exists() else build_insight_report(raw, test_df, lift_df, roi_df, audit)
         st.markdown("#### Analyst memo")
         st.code(summary_text, language="text")
 
@@ -890,9 +1029,13 @@ elif page == "Model Command Center":
     st.markdown("#### Evidence gallery")
     img1, img2 = st.columns(2)
     with img1:
-        st.image(str(OUTPUT_DIR / "roc_curve.png"), caption="ROC curve comparison")
+        roc_path = OUTPUT_DIR / "roc_curve.png"
+        if roc_path.exists():
+            st.image(str(roc_path), caption="ROC curve comparison")
     with img2:
-        st.image(str(OUTPUT_DIR / "precision_recall_curve.png"), caption="Precision-recall view for imbalanced classification")
+        pr_path = OUTPUT_DIR / "precision_recall_curve.png"
+        if pr_path.exists():
+            st.image(str(pr_path), caption="Precision-recall view for imbalanced classification")
 
 elif page == "Campaign ROI Simulator":
     st.markdown("### Campaign ROI simulator")
@@ -967,13 +1110,17 @@ elif page == "Lift & Gain Strategy":
         fig_lift = px.line(lift_df, x="decile", y="lift", markers=True, title="Lift by decile")
         fig_lift.add_hline(y=1.0, line_dash="dot")
         st.plotly_chart(fig_lift, use_container_width=True)
-        st.image(str(OUTPUT_DIR / "lift_chart.png"), caption="Saved lift chart artifact")
+        lift_path = OUTPUT_DIR / "lift_chart.png"
+        if lift_path.exists():
+            st.image(str(lift_path), caption="Saved lift chart artifact")
 
     with right:
         fig_gain = px.line(lift_df, x="cum_customer_pct", y="cum_gain_pct", markers=True, title="Cumulative gain curve")
         fig_gain.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", name="Baseline", line=dict(dash="dash")))
         st.plotly_chart(fig_gain, use_container_width=True)
-        st.image(str(OUTPUT_DIR / "gain_chart.png"), caption="Saved cumulative gain artifact")
+        gain_path = OUTPUT_DIR / "gain_chart.png"
+        if gain_path.exists():
+            st.image(str(gain_path), caption="Saved cumulative gain artifact")
 
     st.markdown("#### Decile strategy table")
     strategy = lift_df[["decile", "customers", "responders", "response_rate", "lift", "cum_gain_pct"]].copy()
