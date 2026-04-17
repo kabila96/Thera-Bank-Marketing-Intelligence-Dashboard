@@ -649,7 +649,7 @@ profit_peak = roi_df.loc[roi_df["net_profit"].idxmax()]
 a, b, c, d = st.columns(4)
 with a:
     st.markdown(
-        f"<div class='kpi-card'><div class='kpi-label'>Portfolio Context</div><div class='kpi-value'>{len(raw):,}</div><div class='kpi-sub'>Customers in modelling dataset</div></div>",
+        f"<div class='kpi-card'><div class='kpi-label'>Dashboard Context</div><div class='kpi-value'>{len(raw):,}</div><div class='kpi-sub'>Customers in modelling dataset</div></div>",
         unsafe_allow_html=True,
     )
 with b:
