@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
@@ -649,7 +649,7 @@ profit_peak = roi_df.loc[roi_df["net_profit"].idxmax()]
 a, b, c, d = st.columns(4)
 with a:
     st.markdown(
-        f"<div class='kpi-card'><div class='kpi-label'>Dashboard Context</div><div class='kpi-value'>{len(raw):,}</div><div class='kpi-sub'>Customers in modelling dataset</div></div>",
+        f"<div class='kpi-card'><div class='kpi-label'>Portfolio Context</div><div class='kpi-value'>{len(raw):,}</div><div class='kpi-sub'>Customers in modelling dataset</div></div>",
         unsafe_allow_html=True,
     )
 with b:
