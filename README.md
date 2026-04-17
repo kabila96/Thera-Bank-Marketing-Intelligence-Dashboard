@@ -11,7 +11,7 @@ Powell A. Ndlovu
 - Model validation command center
 - ROI simulator with threshold controls
 - Lift and cumulative gain strategy views
-- Portfolio notes for presentation/interview use
+- Prediction App
 
 ## Run locally
 ```bash
